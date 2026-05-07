@@ -23,6 +23,7 @@
 #include "slic3r/GUI/I18N.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <iterator>
 #include <exception>
 #include <cstdlib>
@@ -6473,6 +6474,7 @@ void GUI_App::start_sync_user_preset(bool with_progress_dlg)
     ProgressFn progressFn;
     WasCancelledFn cancelFn;
     std::function<void(bool)> finishFn;
+    auto preset_resolution_pending = std::make_shared<std::atomic_bool>(false);
 
     BOOST_LOG_TRIVIAL(info) << "start_sync_service...";
     // BBS
@@ -6488,23 +6490,161 @@ void GUI_App::start_sync_user_preset(bool with_progress_dlg)
         cancelFn = [this, dlg]() {
             return is_closing() || dlg->WasCanceled();
         };
-        finishFn = [this, userid = m_agent->get_user_id(), dlg, t = std::weak_ptr<int>(m_user_sync_token)](bool ok) {
+        finishFn = [this, userid = m_agent->get_user_id(), dlg, t = std::weak_ptr<int>(m_user_sync_token), preset_resolution_pending](bool ok) {
+            if (ok)
+                preset_resolution_pending->store(true);
             CallAfter([=]{
                 dlg->Destroy();
                 if (ok && m_agent && t.lock() == m_user_sync_token && userid == m_agent->get_user_id()) reload_settings();
+                preset_resolution_pending->store(false);
             });
         };
     }
     else {
-        finishFn = [this, userid = m_agent->get_user_id(), t = std::weak_ptr<int>(m_user_sync_token)](bool ok) {
+        finishFn = [this, userid = m_agent->get_user_id(), t = std::weak_ptr<int>(m_user_sync_token), preset_resolution_pending](bool ok) {
+            if (ok)
+                preset_resolution_pending->store(true);
             CallAfter([=] {
                 if (ok && m_agent && t.lock() == m_user_sync_token && userid == m_agent->get_user_id()) reload_settings();
+                preset_resolution_pending->store(false);
             });
         };
         cancelFn = [this]() {
             return is_closing();
         };
     }
+
+    struct CloudPresetChange
+    {
+        std::string type;
+        std::string name;
+        std::string setting_id;
+        long long update_time {0};
+        bool deleted {false};
+    };
+
+    auto make_setting_check_fn = [this](bool *need_reload = nullptr, std::vector<CloudPresetChange> *incoming_changes = nullptr) -> CheckFn {
+        return [this, need_reload, incoming_changes](std::map<std::string, std::string> info) {
+            auto value_or_empty = [&info](const std::string &key) -> std::string {
+                auto it = info.find(key);
+                return it == info.end() ? std::string() : it->second;
+            };
+
+            if (info.find("deleted") != info.end()) {
+                if (need_reload)
+                    *need_reload = true;
+                if (incoming_changes) {
+                    CloudPresetChange change;
+                    change.setting_id = value_or_empty(BBL_JSON_KEY_SETTING_ID);
+                    change.deleted    = true;
+                    incoming_changes->push_back(std::move(change));
+                }
+                return true;
+            }
+
+            auto type            = value_or_empty(BBL_JSON_KEY_TYPE);
+            auto name            = value_or_empty(BBL_JSON_KEY_NAME);
+            auto setting_id      = value_or_empty(BBL_JSON_KEY_SETTING_ID);
+            auto update_time_str = value_or_empty(ORCA_JSON_KEY_UPDATE_TIME);
+            long long update_time = 0;
+            if (!update_time_str.empty())
+                update_time = std::atoll(update_time_str.c_str());
+
+            bool need_sync = true;
+            if (preset_bundle && type == "filament") {
+                need_sync = preset_bundle->filaments.need_sync(name, setting_id, update_time);
+            } else if (preset_bundle && type == "print") {
+                need_sync = preset_bundle->prints.need_sync(name, setting_id, update_time);
+            } else if (preset_bundle && type == "printer") {
+                need_sync = preset_bundle->printers.need_sync(name, setting_id, update_time);
+            }
+
+            if (need_sync) {
+                if (need_reload)
+                    *need_reload = true;
+                if (incoming_changes)
+                    incoming_changes->push_back({ type, name, setting_id, update_time, false });
+            }
+            return need_sync;
+        };
+    };
+
+    auto has_local_preset_changes = [this]() -> bool {
+        if (!preset_bundle)
+            return false;
+
+        auto collection_has_changes = [this](PresetCollection &presets) {
+            if (presets.get_edited_preset().is_user() && presets.current_is_dirty())
+                return true;
+
+            std::vector<Preset> presets_to_sync;
+            return presets.get_user_presets(preset_bundle, presets_to_sync) > 0;
+        };
+
+        return collection_has_changes(preset_bundle->prints) ||
+               collection_has_changes(preset_bundle->filaments) ||
+               collection_has_changes(preset_bundle->printers);
+    };
+
+    auto save_dirty_user_preset_for_sync = [this](PresetCollection &presets) {
+        if (!preset_bundle || !presets.get_edited_preset().is_user() || !presets.current_is_dirty())
+            return;
+
+        const std::string name = presets.get_edited_preset().name;
+        presets.save_current_preset(name, false, false, nullptr);
+        if (Preset *preset = presets.find_preset(name, false, true)) {
+            preset->sync_info = preset->setting_id.empty() ? "create" : "update";
+            if (m_agent)
+                preset->user_id = m_agent->get_user_id();
+            preset->save_info();
+        }
+    };
+
+    auto keep_deleted_cloud_preset_local = [this](PresetCollection &presets, const std::string &setting_id) -> bool {
+        if (setting_id.empty())
+            return false;
+
+        bool found = false;
+        presets.lock();
+        for (Preset &preset : presets) {
+            if (preset.is_user() && preset.setting_id == setting_id) {
+                preset.setting_id.clear();
+                preset.sync_info = "create";
+                if (m_agent)
+                    preset.user_id = m_agent->get_user_id();
+                preset.save_info();
+                found = true;
+                break;
+            }
+        }
+        presets.unlock();
+        return found;
+    };
+
+    auto keep_cloud_changes_local = [this, save_dirty_user_preset_for_sync, keep_deleted_cloud_preset_local](const std::vector<CloudPresetChange> &incoming_changes) {
+        if (!preset_bundle)
+            return;
+
+        save_dirty_user_preset_for_sync(preset_bundle->prints);
+        save_dirty_user_preset_for_sync(preset_bundle->filaments);
+        save_dirty_user_preset_for_sync(preset_bundle->printers);
+
+        for (const CloudPresetChange &change : incoming_changes) {
+            if (change.deleted) {
+                if (!keep_deleted_cloud_preset_local(preset_bundle->prints, change.setting_id) &&
+                    !keep_deleted_cloud_preset_local(preset_bundle->filaments, change.setting_id))
+                    keep_deleted_cloud_preset_local(preset_bundle->printers, change.setting_id);
+                continue;
+            }
+
+            if (change.type == "filament")
+                preset_bundle->filaments.set_sync_info_and_save(change.name, change.setting_id, "update", change.update_time);
+            else if (change.type == "print")
+                preset_bundle->prints.set_sync_info_and_save(change.name, change.setting_id, "update", change.update_time);
+            else if (change.type == "printer")
+                preset_bundle->printers.set_sync_info_and_save(change.name, change.setting_id, "update", change.update_time);
+        }
+    };
 
     // Do a one-time scan for files that may be pending deletion (e.g., was deleted while not connected to internet)
     // Scan for orphaned .info files on startup and add them to deletion queue
@@ -6514,7 +6654,7 @@ void GUI_App::start_sync_user_preset(bool with_progress_dlg)
     Bind(EVT_UPDATE_PRESET_BUNDLE,&GUI_App::update_single_bundle,this);
 
     m_sync_update_thread = Slic3r::create_thread(
-        [this, progressFn, cancelFn, finishFn, t = std::weak_ptr<int>(m_user_sync_token)] {
+        [this, progressFn, cancelFn, finishFn, make_setting_check_fn, has_local_preset_changes, keep_cloud_changes_local, preset_resolution_pending, t = std::weak_ptr<int>(m_user_sync_token)] {
             // get setting list, update setting list
             std::string version = preset_bundle->get_vendor_profile_version(PresetBundle::ORCA_DEFAULT_BUNDLE).to_string();
             if(!m_agent) return;
@@ -6523,24 +6663,7 @@ void GUI_App::start_sync_user_preset(bool with_progress_dlg)
             // So that we can sync presets that are migrated from old version or users manually put preset files in preset folder
             preset_bundle->check_and_fix_user_presets_syncinfo(m_agent->get_user_id());
 
-            int ret = m_agent->get_setting_list2(version, [this](auto info) {
-                auto type = info[BBL_JSON_KEY_TYPE];
-                auto name = info[BBL_JSON_KEY_NAME];
-                auto setting_id = info[BBL_JSON_KEY_SETTING_ID];
-                auto update_time_str = info[ORCA_JSON_KEY_UPDATE_TIME];
-                long long update_time = 0;
-                if (!update_time_str.empty())
-                    update_time = std::atoll(update_time_str.c_str());
-                if (type == "filament") {
-                    return preset_bundle->filaments.need_sync(name, setting_id, update_time);
-                } else if (type == "print") {
-                    return preset_bundle->prints.need_sync(name, setting_id, update_time);
-                } else if (type == "printer") {
-                    return preset_bundle->printers.need_sync(name, setting_id, update_time);
-                } else {
-                    return true;
-                }
-            }, progressFn, cancelFn);
+            int ret = m_agent->get_setting_list2(version, make_setting_check_fn(), progressFn, cancelFn);
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << " get_setting_list2 ret = " << ret << " m_is_closing = " << m_is_closing;
             
             finishFn(ret == 0);
@@ -6563,42 +6686,89 @@ void GUI_App::start_sync_user_preset(bool with_progress_dlg)
                         //sync preset
                         if (!preset_bundle) continue;
 
-                        int total_count = 0;
-                        sync_count = preset_bundle->prints.get_user_presets(preset_bundle, presets_to_sync);
-                        if (sync_count > 0) {
-                            for (Preset& preset : presets_to_sync) {
-                                sync_preset(&preset);
-                                boost::this_thread::sleep_for(boost::chrono::milliseconds(100));
+                        bool cloud_presets_need_reload = false;
+                        std::vector<CloudPresetChange> incoming_changes;
+                        int pull_ret = m_agent->get_setting_list2(
+                            version,
+                            make_setting_check_fn(&cloud_presets_need_reload, &incoming_changes),
+                            nullptr,
+                            [this]() { return is_closing(); });
+                        BOOST_LOG_TRIVIAL(info) << "start_sync_user_preset: periodic get_setting_list2 ret = " << pull_ret
+                                                << ", cloud_presets_need_reload = " << cloud_presets_need_reload;
+                        bool skip_user_preset_upload = preset_resolution_pending->load();
+                        if (pull_ret == 0 && cloud_presets_need_reload) {
+                            skip_user_preset_upload = true;
+                            if (!preset_resolution_pending->exchange(true)) {
+                                CallAfter([this, incoming_changes, has_local_preset_changes, keep_cloud_changes_local, preset_resolution_pending, t] {
+                                    if (is_closing() || !m_agent || t.expired() || t.lock() != m_user_sync_token) {
+                                        preset_resolution_pending->store(false);
+                                        return;
+                                    }
+
+                                    if (!has_local_preset_changes()) {
+                                        BOOST_LOG_TRIVIAL(info) << "start_sync_user_preset: applying incoming cloud preset changes";
+                                        reload_settings();
+                                        preset_resolution_pending->store(false);
+                                        return;
+                                    }
+
+                                    MessageDialog dlg(mainframe,
+                                                      _L("Cloud presets were updated while you have local preset changes.\n\nChoose which version to keep. This decision is final."),
+                                                      _L("Preset sync conflict"),
+                                                      wxYES_NO | wxYES_DEFAULT | wxICON_WARNING);
+                                    dlg.SetButtonLabel(wxID_YES, _L("Use incoming"));
+                                    dlg.SetButtonLabel(wxID_NO, _L("Keep local"));
+                                    int answer = dlg.ShowModal();
+                                    if (answer == wxID_YES) {
+                                        BOOST_LOG_TRIVIAL(info) << "start_sync_user_preset: user chose incoming cloud presets";
+                                        reload_settings();
+                                    } else {
+                                        BOOST_LOG_TRIVIAL(info) << "start_sync_user_preset: user chose local presets";
+                                        keep_cloud_changes_local(incoming_changes);
+                                    }
+                                    preset_resolution_pending->store(false);
+                                });
                             }
                         }
-                        total_count += sync_count;
 
-                        sync_count = preset_bundle->filaments.get_user_presets(preset_bundle, presets_to_sync);
-                        if (sync_count > 0) {
-                            for (Preset& preset : presets_to_sync) {
-                                sync_preset(&preset);
-                                boost::this_thread::sleep_for(boost::chrono::milliseconds(100));
+                        if (!skip_user_preset_upload) {
+                            int total_count = 0;
+                            sync_count = preset_bundle->prints.get_user_presets(preset_bundle, presets_to_sync);
+                            if (sync_count > 0) {
+                                for (Preset& preset : presets_to_sync) {
+                                    sync_preset(&preset);
+                                    boost::this_thread::sleep_for(boost::chrono::milliseconds(100));
+                                }
                             }
-                        }
-                        total_count += sync_count;
+                            total_count += sync_count;
 
-                        sync_count = preset_bundle->printers.get_user_presets(preset_bundle, presets_to_sync);
-                        if (sync_count > 0) {
-                            for (Preset& preset : presets_to_sync) {
-                                sync_preset(&preset);
-                                boost::this_thread::sleep_for(boost::chrono::milliseconds(100));
+                            sync_count = preset_bundle->filaments.get_user_presets(preset_bundle, presets_to_sync);
+                            if (sync_count > 0) {
+                                for (Preset& preset : presets_to_sync) {
+                                    sync_preset(&preset);
+                                    boost::this_thread::sleep_for(boost::chrono::milliseconds(100));
+                                }
                             }
-                        }
-                        total_count += sync_count;
+                            total_count += sync_count;
 
-                        if (total_count == 0) {
-                            CallAfter([this] {
-                                if (!is_closing())
-                                    plater()->get_notification_manager()->close_notification_of_type(NotificationType::BBLUserPresetExceedLimit);
-                            });
-                        }
+                            sync_count = preset_bundle->printers.get_user_presets(preset_bundle, presets_to_sync);
+                            if (sync_count > 0) {
+                                for (Preset& preset : presets_to_sync) {
+                                    sync_preset(&preset);
+                                    boost::this_thread::sleep_for(boost::chrono::milliseconds(100));
+                                }
+                            }
+                            total_count += sync_count;
 
-                        process_delete_presets();
+                            if (total_count == 0) {
+                                CallAfter([this] {
+                                    if (!is_closing())
+                                        plater()->get_notification_manager()->close_notification_of_type(NotificationType::BBLUserPresetExceedLimit);
+                                });
+                            }
+
+                            process_delete_presets();
+                        }
                     }
 
                     // sync subscribed bundles, if orca
