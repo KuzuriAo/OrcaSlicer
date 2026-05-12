@@ -1213,12 +1213,25 @@ int CLI::run(int argc, char **argv)
 
     // XInitThreads is needed before GStreamer may use Xlib. On native
     // Wayland without DISPLAY, GStreamer uses waylandsink (no Xlib).
+    // Install a custom X11 error handler to prevent the default handler
+    // from calling exit()/abort() on non-fatal X11 errors. This is
+    // necessary on XWayland where GDK/X11 operations can produce
+    // BadWindow errors during widget realization of GStreamer sinks.
     #if __has_include(<X11/Xlib.h>)
     {
         const char* display_env = ::getenv("DISPLAY");
         if (display_env && *display_env) {
             XInitThreads();
         }
+        XSetErrorHandler([](Display* dpy, XErrorEvent* evt) -> int {
+            char buffer[256];
+            XGetErrorText(dpy, evt->error_code, buffer, sizeof(buffer));
+            BOOST_LOG_TRIVIAL(error) << boost::format(
+                "X11 error: %1% (code=%2%, request=%3%, resource=0x%|4$08x|)")
+                % buffer % static_cast<int>(evt->error_code)
+                % static_cast<int>(evt->request_code) % evt->resourceid;
+            return 0;
+        });
     }
     #endif
 #endif
