@@ -4835,12 +4835,12 @@ void GUI_App::on_http_error(wxCommandEvent &evt)
                 BOOST_LOG_TRIVIAL(warning) << "logout: http error 401.";
                 this->request_user_logout(provider);
 
-                if (!m_show_http_errpr_msgdlg) {
+                if (!m_show_http_error_msgdlg) {
                     MessageDialog msg_dlg(nullptr, _L("Login information expired. Please login again."), "", wxAPPLY | wxOK);
-                    m_show_http_errpr_msgdlg = true;
+                    m_show_http_error_msgdlg = true;
                     auto modal_result = msg_dlg.ShowModal();
                     if (modal_result == wxOK || modal_result == wxCLOSE) {
-                        m_show_http_errpr_msgdlg = false;
+                        m_show_http_error_msgdlg = false;
                         return;
                     }
                 }
@@ -4851,9 +4851,9 @@ void GUI_App::on_http_error(wxCommandEvent &evt)
 
     // Show general error notification for Orca Cloud API failures (not Bambu)
     if (provider == ORCA_CLOUD_PROVIDER && status >= 400 && code != HttpErrorVersionLimited) {
-        if (m_show_http_errpr_msgdlg)
+        if (m_show_http_error_msgdlg)
             return;
-        m_show_http_errpr_msgdlg = true;
+        m_show_http_error_msgdlg = true;
 
         wxString msg;
         if (!error.empty()) {
@@ -4862,7 +4862,7 @@ void GUI_App::on_http_error(wxCommandEvent &evt)
             msg = wxString::Format(_L("API error (HTTP %u)"), status);
         }
         wxMessageBox(msg, _L("Orca Cloud API Error"), wxOK | wxICON_ERROR, wxGetApp().mainframe);
-        m_show_http_errpr_msgdlg = false;
+        m_show_http_error_msgdlg = false;
     }
 }
 
